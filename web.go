@@ -33,7 +33,7 @@ func main() {
 
 	exitChan = make(chan struct{}) // 创建用于通知主循环何时退出的通道
 
-	socketUrl := "ws://127.0.0.1:8080/ws/self/3c2cc301-93c3-47af-9088-4f1750543d69/" //ws url
+	socketUrl := "ws://127.0.0.1:8080/ws/self/3c2cc301-93c3-47af-9088-4f1750543d69/" //需要连接的url地址
 
 	conn, err := connect(socketUrl)
 	if err != nil {
