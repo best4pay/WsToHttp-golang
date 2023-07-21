@@ -1,3 +1,7 @@
+// 这是一个协议转换程序
+// 通过传入一个url参数连接ws服务器
+// 并开启8300端口监听http协议
+
 package main
 
 import (
