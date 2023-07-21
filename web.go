@@ -3,12 +3,16 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/fatih/color"
@@ -20,10 +24,61 @@ var exitChan chan struct{}     // 用于通知主循环何时退出的通道
 var sendQueue chan []byte      //定义发送队列
 var receiveQueue chan []byte   //定义接收队列
 
+func isURLValid(rawURL string) (bool, error) {
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil {
+		return false, errors.New("格式不正确") // URL 格式不正确
+	}
+
+	// 在这里可以根据具体业务需求判断 URL 的协议和主机是否在白名单中
+	// 这里仅作为示例，判断协议是否为 "wss"，主机是否为 "best4pay.com"
+	if parsedURL.Scheme != "ws" && parsedURL.Scheme != "wss" {
+		return false, errors.New("不是ws或者wss的url")
+	}
+
+	// 提取路径部分
+	path := parsedURL.Path
+	splitted := strings.Split(path, "/")
+	if len(splitted) >= 2 {
+		uuid := splitted[len(splitted)-2]
+		if !isUUID(uuid) {
+			return false, errors.New("uuid格式不正确")
+		}
+	} else {
+		return false, errors.New("路径中uuid位置不正确")
+	}
+
+	return true, nil
+}
+
+func isUUID(s string) bool {
+	// 使用正则表达式判断是否为 UUID
+	uuidPattern := `^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`
+	match, err := regexp.MatchString(uuidPattern, s)
+	if err != nil {
+		return false
+	}
+	return match
+}
+
 func main() {
 
 	sendQueue = make(chan []byte, 0xffff)    // 初始化发送队列长度65535
 	receiveQueue = make(chan []byte, 0xffff) // 初始化发送队列长度65535
+
+	// 获取传入的命令行参数
+	args := os.Args
+
+	if len(args) > 1 {
+		isURL, err := isURLValid(args[1])
+		if !isURL { //如果窜入参数不合法就退出程序
+			log.Println("传入参数", err)
+			return
+		}
+	} else {
+		log.Println("没有传入url")
+		return
+	}
 
 	// 运行web
 	go runWeb()
@@ -33,7 +88,7 @@ func main() {
 
 	exitChan = make(chan struct{}) // 创建用于通知主循环何时退出的通道
 
-	socketUrl := "wss://best4pay.com/ws/self/3c2cc301-93c3-47af-9088-4f1750543d69/" //
+	socketUrl := args[1]
 
 	conn, err := connect(socketUrl)
 	if err != nil {
