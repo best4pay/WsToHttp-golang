@@ -8,21 +8,19 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
+	"os/signal"
 	"time"
 
 	"github.com/fatih/color"
 	"github.com/gorilla/websocket"
 )
 
-var ws *websocket.Conn       //定义websocket
-var sendQueue chan []byte    //定义发送队列
-var receiveQueue chan []byte //定义接收队列
-var error_int = 0            //记录错误次数
+var interrupted chan os.Signal // 用于监听中断信号的通道，以优雅地终止程序
+var exitChan chan struct{}     // 用于通知主循环何时退出的通道
+var sendQueue chan []byte      //定义发送队列
+var receiveQueue chan []byte   //定义接收队列
 
 func main() {
-
-	time.Sleep(3000 * time.Millisecond) //3秒后启动
 
 	sendQueue = make(chan []byte, 0xffff)    // 初始化发送队列长度65535
 	receiveQueue = make(chan []byte, 0xffff) // 初始化发送队列长度65535
@@ -30,189 +28,173 @@ func main() {
 	// 运行web
 	go runWeb()
 
-	// 建立 WebSocket 连接并处理连接中断的逻辑
-	go runWebSocket()
+	interrupted = make(chan os.Signal)       // 创建用于监听中断信号的通道
+	signal.Notify(interrupted, os.Interrupt) // 监听中断信号（SIGINT，即Ctrl+C）
 
-	// 持续运行，防止程序退出
-	select {}
+	exitChan = make(chan struct{}) // 创建用于通知主循环何时退出的通道
 
-}
+	socketUrl := "ws://127.0.0.1:8080/ws/self/3c2cc301-93c3-47af-9088-4f1750543d69/" //ws url
 
-func runslef() {
-	// 获取可执行文件的路径
-	executable, err := os.Executable()
+	conn, err := connect(socketUrl)
 	if err != nil {
-		fmt.Println("获取可执行文件路径失败:", err)
-		return
+		log.Fatal("连接到 Websocket 服务器时出错:", err)
 	}
+	defer conn.Close()
 
-	log.Println("executable:", executable)
+	receiveDone := make(chan struct{}) // 用于通知接收消息的goroutine停止执行
 
-	// 重新启动程序
-	cmd := exec.Command(executable, os.Args[1:]...)
-	err = cmd.Start()
-	if err != nil {
-		fmt.Println("重新启动程序失败:", err)
-		return
+	// 用于接收来自WebSocket服务器的消息
+	go func() {
+		defer close(receiveDone) // 关闭通知接收消息goroutine停止执行的通道
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				log.Println("接收错误:", err)
+
+				// 尝试重新连接
+				for {
+					log.Println("尝试重新连接...")
+					newConn, err := connect(socketUrl)
+					if err == nil {
+						conn.Close() // 关闭旧的连接
+						conn = newConn
+						go sendMessages(conn) // 重新启动发送消息的goroutine
+						break
+					}
+					time.Sleep(5 * time.Second)
+				}
+				continue // 继续接收消息
+			}
+
+			// 打印接收到的消息
+			color.Cyan("ws服务器发来的消息:")
+			color.Magenta("%s\n", string(msg))
+
+			//log.Printf("变量类型: %T\n", receivedMessage)
+
+			// 解析接收到的 JSON 数据
+			var data map[string]interface{}
+			err = json.Unmarshal(msg, &data)
+			if err != nil {
+				log.Println("json数据解析失败:", err)
+				continue
+			}
+
+			nonce_hash, ok := data["nonce_hash"].(string)
+
+			log.Println("nonce_hash:", nonce_hash)
+
+			// 判断键是否存在
+			callbackURL, ok := data["callback_url"].(string)
+			if ok { //如果url存在就post url地址回调
+
+				client_order_no, ok := data["data"].(map[string]interface{})["client_order_no"].(string)
+				uuid, ok := data["uuid"].(string)
+				json_type, ok := data["type"].(string)
+				if !ok {
+					//log.Println("client_order_no:", client_order_no)
+					continue
+				}
+
+				// 删除指定的键值对
+				delete(data, "callback_url")
+
+				// 将 map 转换为 JSON 字符串
+				jsonStr, err := json.Marshal(data)
+				if err != nil {
+					log.Println("无法转换map到json:", err)
+					continue
+				}
+
+				// 发送 POST 请求
+				resp, err := http.Post(callbackURL, "application/json;charset=utf-8", bytes.NewBuffer(jsonStr))
+				if err != nil {
+					log.Println("发送POST请求失败:", err)
+					continue
+				}
+				defer resp.Body.Close()
+
+				color.Cyan("http请求地址:")
+				color.Magenta("%s\n", callbackURL)
+
+				// 处理响应
+				color.Cyan("http响应状态:")
+				color.Magenta("%s\n", resp.Status)
+
+				// 读取响应的内容
+				body, err := ioutil.ReadAll(resp.Body)
+				if err != nil {
+					log.Println("无法读取响应正文:", err)
+					continue
+				}
+				color.Cyan("http响应 Body:")
+				color.Magenta("%s\n", string(body))
+
+				jsonData := `{"type": "%s","nonce_hash": "%s","data": {"client_order_no": "%s"},"result": "%s","msg": %s,"uuid":"%s"}` //构建一个json
+
+				json_body, err := json.Marshal(body)
+				if err != nil {
+					log.Println("JSON 编码失败:", err)
+				}
+
+				log.Println("JSON内容:", string(json_body))
+
+				if resp.StatusCode == http.StatusOK { //页面正常返回,通知ws服务器
+					send(body) //向服务器发送回调成功
+					log.Println("发送的内容:", string(body))
+				} else {
+
+					json := fmt.Sprintf(jsonData, json_type, nonce_hash, client_order_no, "fail", json_body, uuid) //替换变量到json中
+					send([]byte(json))
+					log.Println("发送的内容:", json) //向服务器发送回调失败
+				}
+
+			} else {
+				// 写入接收队列
+				receiveQueue <- msg
+				//log.Println("没找到url:", string(receivedMessage))
+			}
+		}
+	}()
+
+	// 监听中断信号的goroutine，收到中断信号时发送退出信号到exitChan
+	go func() {
+		<-interrupted
+		log.Println("收到SIGINT中断信号。退出程序...")
+
+		// 关闭WebSocket连接，发送关闭消息给服务器
+		err := conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		if err != nil {
+			log.Println("关闭 websocket 时出错:", err)
+		}
+
+		select {
+		case <-time.After(time.Duration(1) * time.Second):
+			log.Println("关闭连接超时。")
+		}
+
+		close(exitChan)
+	}()
+
+	// 启动发送消息的goroutine
+	go sendMessages(conn)
+
+	// 客户端主循环
+	for {
+		select {
+		case <-time.After(time.Duration(1) * time.Second):
+			// 在此处可以添加其他需要定时执行的任务
+
+		case <-exitChan:
+			log.Println("退出主循环。")
+			return // 退出程序
+		}
 	}
-
-	// 关闭当前程序
-	os.Exit(0)
 }
 
 func runWeb() {
 	http.HandleFunc("/", handleRequest)
 	log.Println(http.ListenAndServe(":8080", nil))
-}
-
-func runWebSocket() {
-	var err error // 声明 err 变量
-
-	// WebSocket 服务器地址
-	url := "ws://127.0.0.1:9000"
-	url = "ws://192.168.1.9:8090/ws/self/3c2cc301-93c3-47af-9088-4f1750543d69/"
-
-	// 设置 WebSocket 连接的请求头
-	header := http.Header{}
-	header.Set("Authorization", "Bearer your-token")
-
-	// 创建一个 Dialer 实例
-	dialer := websocket.DefaultDialer
-
-	// 使用 Dialer 建立 WebSocket 连接
-	ws, _, err = dialer.Dial(url, header)
-	if err != nil {
-		log.Println("无法连接到 WebSocket:", err)
-		time.Sleep(5 * time.Second) // 等待一段时间后重新连接
-		go runWebSocket()
-		return
-	} else {
-		log.Println("WebSocket连接成功")
-	}
-	defer ws.Close()
-
-	go receive() //接收消息
-
-	var msg []byte
-	for { //这个循环会一直等待,直到有消息可以发送
-		msg = <-sendQueue
-		//向ws服务器发送的消息
-		color.Cyan("向ws服务器发送的消息:")
-		color.Magenta("%s\n", string(msg))
-		err = ws.WriteMessage(websocket.TextMessage, msg) //取出并发送队列
-		if err != nil {
-			log.Println("发送消息失败:", err)
-			go runWebSocket()
-			return
-		}
-
-	}
-
-}
-
-func send(message []byte) {
-	sendQueue <- message //插入队列
-}
-
-func receive() {
-	for {
-		_, receivedMessage, err := ws.ReadMessage()
-		if err != nil {
-			log.Println("接收消息失败:", err)
-			return
-		}
-
-		// 打印接收到的消息
-		color.Cyan("ws服务器发来的消息:")
-		color.Magenta("%s\n", string(receivedMessage))
-
-		//log.Printf("变量类型: %T\n", receivedMessage)
-
-		// 解析接收到的 JSON 数据
-		var data map[string]interface{}
-		err = json.Unmarshal(receivedMessage, &data)
-		if err != nil {
-			log.Println("json数据解析失败:", err)
-			continue
-		}
-
-		log.Println("接收到的ws数据:", string(receivedMessage))
-
-		nonce_hash, ok := data["nonce_hash"].(string)
-
-		log.Println("nonce_hash:", nonce_hash)
-
-		// 判断键是否存在
-		callbackURL, ok := data["callback_url"].(string)
-		if ok { //如果url存在就post url地址回调
-
-			client_order_no, ok := data["data"].(map[string]interface{})["client_order_no"].(string)
-			uuid, ok := data["uuid"].(string)
-			json_type, ok := data["type"].(string)
-			if !ok {
-				//log.Println("client_order_no:", client_order_no)
-				continue
-			}
-
-			// 删除指定的键值对
-			delete(data, "callback_url")
-
-			// 将 map 转换为 JSON 字符串
-			jsonStr, err := json.Marshal(data)
-			if err != nil {
-				log.Println("无法转换map到json:", err)
-				continue
-			}
-
-			// 发送 POST 请求
-			resp, err := http.Post(callbackURL, "application/json;charset=utf-8", bytes.NewBuffer(jsonStr))
-			if err != nil {
-				log.Println("发送POST请求失败:", err)
-				continue
-			}
-			defer resp.Body.Close()
-
-			color.Cyan("http请求地址:")
-			color.Magenta("%s\n", callbackURL)
-
-			// 处理响应
-			color.Cyan("http响应状态:")
-			color.Magenta("%s\n", resp.Status)
-
-			// 读取响应的内容
-			body, err := ioutil.ReadAll(resp.Body)
-			if err != nil {
-				log.Println("无法读取响应正文:", err)
-				continue
-			}
-			color.Cyan("http响应 Body:")
-			color.Magenta("%s\n", string(body))
-
-			jsonData := `{"type": "%s","nonce_hash": "%s","data": {"client_order_no": "%s"},"result": "%s","msg": %s,"uuid":"%s"}` //构建一个json
-
-			json_body, err := json.Marshal(body)
-			if err != nil {
-				log.Println("JSON 编码失败:", err)
-			}
-
-			log.Println("JSON内容:", string(json_body))
-
-			if resp.StatusCode == http.StatusOK { //页面正常返回,通知ws服务器
-				send(body) //向服务器发送回调成功
-				log.Println("发送的内容:", string(body))
-			} else {
-
-				json := fmt.Sprintf(jsonData, json_type, nonce_hash, client_order_no, "fail", json_body, uuid) //替换变量到json中
-				send([]byte(json))
-				log.Println("发送的内容:", json) //向服务器发送回调失败
-			}
-
-		} else {
-			// 写入接收队列
-			receiveQueue <- receivedMessage
-			//log.Println("没找到url:", string(receivedMessage))
-		}
-	}
 }
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
@@ -304,4 +286,29 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(408)
 	w.Write([]byte("超时 错误:408")) //这里显示超时页面
+}
+
+func send(message []byte) {
+	sendQueue <- message //插入队列
+}
+
+// 连接到服务器的函数
+func connect(socketUrl string) (*websocket.Conn, error) {
+	conn, _, err := websocket.DefaultDialer.Dial(socketUrl, nil)
+	return conn, err
+}
+
+// 发送消息到服务器的函数
+func sendMessages(conn *websocket.Conn) {
+	for {
+		select {
+		case <-time.After(time.Duration(1) * time.Second):
+			// 每隔一秒发送一次"Hello from GolangDocs!"消息给服务器
+			err := conn.WriteMessage(websocket.TextMessage, <-sendQueue) //发送队列中的 消息
+			if err != nil {
+				log.Println("发送消息出错:", err)
+				return
+			}
+		}
+	}
 }
