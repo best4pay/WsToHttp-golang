@@ -33,11 +33,13 @@ func main() {
 
 	exitChan = make(chan struct{}) // 创建用于通知主循环何时退出的通道
 
-	socketUrl := "ws://127.0.0.1:8080/ws/self/3c2cc301-93c3-47af-9088-4f1750543d69/" //需要连接的url地址
+	socketUrl := "wss://best4pay.com/ws/self/3c2cc301-93c3-47af-9088-4f1750543d69/" //
 
 	conn, err := connect(socketUrl)
 	if err != nil {
 		log.Fatal("连接到 Websocket 服务器时出错:", err)
+	} else {
+		log.Println("ws连接成功")
 	}
 	defer conn.Close()
 
@@ -49,17 +51,21 @@ func main() {
 		for {
 			_, msg, err := conn.ReadMessage()
 			if err != nil {
+
 				log.Println("接收错误:", err)
 
 				// 尝试重新连接
 				for {
-					log.Println("尝试重新连接...")
+					time.Sleep(5 * time.Second)
+					log.Println("正在重新连接...")
 					newConn, err := connect(socketUrl)
 					if err == nil {
 						conn.Close() // 关闭旧的连接
 						conn = newConn
 						go sendMessages(conn) // 重新启动发送消息的goroutine
 						break
+					} else {
+						log.Println("ws连接成功")
 					}
 					time.Sleep(5 * time.Second)
 				}
@@ -163,6 +169,7 @@ func main() {
 		log.Println("收到SIGINT中断信号。退出程序...")
 
 		// 关闭WebSocket连接，发送关闭消息给服务器
+		log.Println("通知服务器关闭当前连接")
 		err := conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 		if err != nil {
 			log.Println("关闭 websocket 时出错:", err)
@@ -170,7 +177,7 @@ func main() {
 
 		select {
 		case <-time.After(time.Duration(1) * time.Second):
-			log.Println("关闭连接超时。")
+			log.Println("消息超时,没有收到服务器返回的关闭消息。")
 		}
 
 		close(exitChan)
@@ -194,7 +201,7 @@ func main() {
 
 func runWeb() {
 	http.HandleFunc("/", handleRequest)
-	log.Println(http.ListenAndServe(":8080", nil))
+	log.Println(http.ListenAndServe(":8300", nil))
 }
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
