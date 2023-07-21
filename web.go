@@ -202,12 +202,12 @@ func main() {
 
 				if resp.StatusCode == http.StatusOK { //页面正常返回,通知ws服务器
 					send(body) //向服务器发送回调成功
-					log.Println("发送的内容:", string(body))
+					//log.Println("发送的内容:", string(body))
 				} else {
 
 					json := fmt.Sprintf(jsonData, json_type, nonce_hash, client_order_no, "fail", json_body, uuid) //替换变量到json中
 					send([]byte(json))
-					log.Println("发送的内容:", json) //向服务器发送回调失败
+					log.Println("页面返回不正常:", json) //向服务器发送回调失败
 				}
 
 			} else {
